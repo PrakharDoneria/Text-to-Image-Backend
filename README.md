@@ -1,5 +1,3 @@
----
-
 # ProLLM Image Generator API
 
 ## Front-end Usage
@@ -75,5 +73,3 @@ Example Response:
   "error": "Internal server error. Please try again later."
 }
 ```
-
----
