@@ -30,10 +30,82 @@ const userSchema = new mongoose.Schema({
     username: String,
     lastRequestTimestamp: Date,
     requestsMade: Number,
-    userType: String
+    userType: String,
+    premiumExpiration: Date
 });
 
 const User = mongoose.model('User', userSchema);
+
+app.get('/', (req, res) => {
+    res.send('Server is running');
+});
+
+app.get('/prompt', async (req, res) => {
+    const prompt = req.query.prompt;
+    const ipAddress = req.query.ip;
+
+    if (!prompt || !ipAddress) {
+        return res.status(400).json({ error: 'Both prompt and IP address are required.' });
+    }
+
+    try {
+        let user = await User.findOne({ username: ipAddress });
+        const now = Date.now();
+
+        if (!user || (user.lastRequestTimestamp && (now - user.lastRequestTimestamp) >= 24 * 60 * 60 * 1000)) {
+            user = await User.findOneAndUpdate(
+                { username: ipAddress },
+                { lastRequestTimestamp: now, requestsMade: 0, userType: 'free', premiumExpiration: null },
+                { upsert: true, new: true }
+            );
+        }
+
+        if (user.userType === 'free' && user.requestsMade >= 3) {
+            return res.status(403).json({ error: 'Daily limit exceeded for free users. Upgrade to pro for unlimited access.' });
+        }
+
+        user.requestsMade++;
+        user.lastRequestTimestamp = now;
+        await user.save();
+
+        const imageUrl = await getProLLMResponse(prompt);
+        if (imageUrl.error) {
+            return res.status(500).json({ error: imageUrl.error });
+        }
+
+        res.json({ code: 200, url: imageUrl });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Internal server error. Please try again later.' });
+    }
+});
+
+app.get('/add', async (req, res) => {
+    const ipAddress = req.query.ip;
+
+    if (!ipAddress) {
+        return res.status(400).json({ error: 'IP address is required.' });
+    }
+
+    try {
+        let user = await User.findOne({ username: ipAddress });
+
+        const expirationDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+        if (!user) {
+            user = await User.create({ username: ipAddress, lastRequestTimestamp: Date.now(), requestsMade: 0, userType: 'PAID', premiumExpiration: expirationDate });
+        } else {
+            user.userType = 'PAID';
+            user.premiumExpiration = expirationDate;
+            await user.save();
+        }
+
+        res.json({ code: 200, message: 'Account upgraded to premium successfully.' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Internal server error. Please try again later.' });
+    }
+});
 
 async function getProLLMResponse(prompt) {
     try {
@@ -77,15 +149,27 @@ async function getProLLMResponse(prompt) {
         const imageResponse = await fetch(imageUrl);
         const buffer = await imageResponse.buffer();
 
-        const tempFilePath = join(tmpdir(), `${Date.now()}.jpeg`);
-        await fsPromises.writeFile(tempFilePath, buffer);
-
-        // Upload image to Firebase Storage
         const bucket = storage.bucket();
         const firebaseFileName = `images/${Date.now()}.jpeg`;
-        await bucket.file(firebaseFileName).save(buffer);
+        const file = bucket.file(firebaseFileName);
 
-        // Generate public URL for the uploaded image
+        await new Promise((resolve, reject) => {
+            const stream = file.createWriteStream({
+                metadata: {
+                    contentType: 'image/jpeg'
+                }
+            });
+
+            stream.on('error', (error) => {
+                reject(error);
+            });
+            stream.on('finish', () => {
+                resolve();
+            });
+
+            stream.end(buffer);
+        });
+
         const firebaseImageUrl = `https://storage.googleapis.com/${firebaseConfig.storageBucket}/${firebaseFileName}`;
 
         return firebaseImageUrl;
@@ -93,50 +177,6 @@ async function getProLLMResponse(prompt) {
         return { error: 'Internal server error. Please try again later.' };
     }
 }
-
-app.get('/', (req, res) => {
-    res.send('Server is running');
-});
-
-app.get('/prompt', async (req, res) => {
-    const prompt = req.query.prompt;
-    const ipAddress = req.query.ip;
-
-    if (!prompt || !ipAddress) {
-        return res.status(400).json({ error: 'Both prompt and IP address are required.' });
-    }
-
-    try {
-        let user = await User.findOne({ username: ipAddress });
-        if (!user) {
-            user = await User.create({ username: ipAddress, lastRequestTimestamp: Date.now(), requestsMade: 0, userType: 'free' });
-        }
-
-        const now = Date.now();
-        const elapsedTime = now - user.lastRequestTimestamp;
-        if (elapsedTime >= 24 * 60 * 60 * 1000) {
-            user.requestsMade = 0;
-        }
-
-        if (user.userType === 'free' && user.requestsMade >= 3) {
-            return res.status(403).json({ error: 'Daily limit exceeded for free users. Upgrade to pro for unlimited access.' });
-        }
-
-        user.requestsMade++;
-        user.lastRequestTimestamp = now;
-        await user.save();
-
-        const imageUrl = await getProLLMResponse(prompt);
-        if (imageUrl.error) {
-            return res.status(500).json({ error: imageUrl.error });
-        }
-
-        res.json({ code: 200, url: imageUrl });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Internal server error. Please try again later.' });
-    }
-});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
